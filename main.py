@@ -41,45 +41,63 @@ SKIP_NEZHA = env("SKIP_NEZHA") == "1"
 CORE_PORT = 8001
 
 ARCH = "arm64" if platform.machine().lower() in ("aarch64", "arm64") else "amd64"
-SB_VER, NZ_VER = "1.11.15", "v1.13.1"
+SB_VER, NZ_VER, CF_VER = "1.11.15", "v1.13.1", "2025.11.1"
 # name on disk -> (kind, url, member-in-archive); used only if the binary is missing
 URLS = {
     "app-core": ("tar", f"https://github.com/SagerNet/sing-box/releases/download/v{SB_VER}/sing-box-{SB_VER}-linux-{ARCH}.tar.gz", f"sing-box-{SB_VER}-linux-{ARCH}/sing-box"),
     "app-report": ("zip", f"https://github.com/nezhahq/agent/releases/download/{NZ_VER}/nezha-agent_linux_{ARCH}.zip", "nezha-agent"),
-    "app-edge": ("raw", f"https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-{ARCH}", ""),
+    "app-edge": ("raw", f"https://github.com/cloudflare/cloudflared/releases/download/{CF_VER}/cloudflared-linux-{ARCH}", ""),
 }
 
 def ensure_bin(name):
-    """Return the disk path to a helper binary, downloading to disk only if absent.
-    Never holds the whole binary in memory (streams to file)."""
+    """Return the disk path to a helper binary, streaming the download to disk
+    (never holding it in memory) with a hard deadline so a stalled fetch can't hang boot."""
     path = os.path.join(RUN, name)
     try:
         if os.path.getsize(path) > 1000000:
             return path
     except OSError:
         pass
-    import io, tarfile, zipfile
+    import shutil, tarfile, zipfile
     kind, url, member = URLS[name]
-    for attempt in range(3):
+    tmp = path + ".dl"
+    for attempt in range(4):
+        log(f"fetch {name}: start try{attempt}")
         try:
+            deadline = time.time() + 180
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=120) as r:
-                blob = r.read()
+            got = 0
+            with urllib.request.urlopen(req, timeout=30) as r, open(tmp, "wb") as f:
+                while True:
+                    if time.time() > deadline:
+                        raise TimeoutError("download deadline exceeded")
+                    chunk = r.read(262144)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    got += len(chunk)
             if kind == "raw":
-                data = blob
+                os.replace(tmp, path)
             elif kind == "zip":
-                data = zipfile.ZipFile(io.BytesIO(blob)).read(member)
+                with zipfile.ZipFile(tmp) as z, z.open(member) as src, open(path, "wb") as dst:
+                    shutil.copyfileobj(src, dst, 262144)
+                os.remove(tmp)
             else:
-                data = tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz").extractfile(member).read()
-            with open(path, "wb") as f:
-                f.write(data)
+                with tarfile.open(tmp, mode="r:gz") as t:
+                    src = t.extractfile(member)
+                    with open(path, "wb") as dst:
+                        shutil.copyfileobj(src, dst, 262144)
+                os.remove(tmp)
             os.chmod(path, 0o755)
-            log(f"fetch {name}: ok {len(data)} bytes")
-            del blob, data
+            log(f"fetch {name}: ok {os.path.getsize(path)} bytes (downloaded {got})")
             return path
         except Exception as e:
-            log(f"fetch {name} try{attempt}: {e}")
-            time.sleep(4)
+            log(f"fetch {name} try{attempt}: {e!r}")
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            time.sleep(5)
     log(f"fetch {name}: FAILED")
     return None
 
@@ -203,6 +221,7 @@ def main():
         if r:
             supervise("report", r, ["-c", os.path.join(RUN, "report.yml")], {"GOMAXPROCS": "1"})
             time.sleep(3)
+    log(f"edge: run_edge={RUN_EDGE} argo_set={bool(ARGO)} tid_set={bool(tid)}")
     if RUN_EDGE and ARGO and tid:
         ed = ensure_bin("app-edge")
         if ed:
